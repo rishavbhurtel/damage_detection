@@ -1,0 +1,26 @@
+<annotation>
+	<folder>data</folder>
+	<filename>31.jpg</filename>
+	<path>F:\Material\internship\IOTric\data\31.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>801</width>
+		<height>301</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>bullseye</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>313</xmin>
+			<ymin>40</ymin>
+			<xmax>451</xmax>
+			<ymax>151</ymax>
+		</bndbox>
+	</object>
+</annotation>

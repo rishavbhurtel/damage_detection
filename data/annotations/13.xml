@@ -1,0 +1,26 @@
+<annotation>
+	<folder>data</folder>
+	<filename>13.jpg</filename>
+	<path>F:\Material\internship\IOTric\data\13.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>992</width>
+		<height>558</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>crack</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>333</xmin>
+			<ymin>136</ymin>
+			<xmax>652</xmax>
+			<ymax>319</ymax>
+		</bndbox>
+	</object>
+</annotation>
