@@ -2,9 +2,8 @@ import warnings
 
 import matplotlib.pyplot as plt
 import mmcv
-import numpy as np
-import pycocotools.mask as maskUtils
 import torch
+from mmcv.ops import RoIAlign, RoIPool
 from mmcv.parallel import collate, scatter
 from mmcv.runner import load_checkpoint
 
@@ -29,14 +28,16 @@ def init_detector(config, checkpoint=None, device='cuda:0'):
         config = mmcv.Config.fromfile(config)
     elif not isinstance(config, mmcv.Config):
         raise TypeError('config must be a filename or Config object, '
-                        'but got {}'.format(type(config)))
+                        f'but got {type(config)}')
     config.model.pretrained = None
     model = build_detector(config.model, test_cfg=config.test_cfg)
     if checkpoint is not None:
-        checkpoint = load_checkpoint(model, checkpoint)
+        map_loc = 'cpu' if device == 'cpu' else None
+        checkpoint = load_checkpoint(model, checkpoint, map_location=map_loc)
         if 'CLASSES' in checkpoint['meta']:
             model.CLASSES = checkpoint['meta']['CLASSES']
         else:
+            warnings.simplefilter('once')
             warnings.warn('Class names are not saved in the checkpoint\'s '
                           'meta data, use COCO classes by default.')
             model.CLASSES = get_classes('coco')
@@ -47,14 +48,27 @@ def init_detector(config, checkpoint=None, device='cuda:0'):
 
 
 class LoadImage(object):
+    """A simple pipeline to load image."""
 
     def __call__(self, results):
+        """Call function to load images into results.
+
+        Args:
+            results (dict): A result dict contains the file name
+                of the image to be read.
+
+        Returns:
+            dict: ``results`` will be returned containing loaded image.
+        """
         if isinstance(results['img'], str):
             results['filename'] = results['img']
+            results['ori_filename'] = results['img']
         else:
             results['filename'] = None
+            results['ori_filename'] = None
         img = mmcv.imread(results['img'])
         results['img'] = img
+        results['img_fields'] = ['img']
         results['img_shape'] = img.shape
         results['ori_shape'] = img.shape
         return results
@@ -80,92 +94,70 @@ def inference_detector(model, img):
     # prepare data
     data = dict(img=img)
     data = test_pipeline(data)
-    data = scatter(collate([data], samples_per_gpu=1), [device])[0]
+    data = collate([data], samples_per_gpu=1)
+    if next(model.parameters()).is_cuda:
+        # scatter to specified GPU
+        data = scatter(data, [device])[0]
+    else:
+        # Use torchvision ops for CPU mode instead
+        for m in model.modules():
+            if isinstance(m, (RoIPool, RoIAlign)):
+                if not m.aligned:
+                    # aligned=False is not implemented on CPU
+                    # set use_torchvision on-the-fly
+                    m.use_torchvision = True
+        warnings.warn('We set use_torchvision=True in CPU mode.')
+        # just get the actual data from DataContainer
+        data['img_metas'] = data['img_metas'][0].data
+
     # forward the model
     with torch.no_grad():
         result = model(return_loss=False, rescale=True, **data)
-
     return result
 
 
-# TODO: merge this method with the one in BaseDetector
-def show_result(img,
-                result,
-                class_names,
-                score_thr=0.3,
-                wait_time=0,
-                show=True,
-                out_file=None):
-    """Visualize the detection results on the image.
+async def async_inference_detector(model, img):
+    """Async inference image(s) with the detector.
 
     Args:
-        img (str or np.ndarray): Image filename or loaded image.
-        result (tuple[list] or list): The detection result, can be either
-            (bbox, segm) or just bbox.
-        class_names (list[str] or tuple[str]): A list of class names.
-        score_thr (float): The threshold to visualize the bboxes and masks.
-        wait_time (int): Value of waitKey param.
-        show (bool, optional): Whether to show the image with opencv or not.
-        out_file (str, optional): If specified, the visualization result will
-            be written to the out file instead of shown in a window.
+        model (nn.Module): The loaded detector.
+        imgs (str/ndarray or list[str/ndarray]): Either image files or loaded
+            images.
 
     Returns:
-        np.ndarray or None: If neither `show` nor `out_file` is specified, the
-            visualized image is returned, otherwise None is returned.
+        Awaitable detection results.
     """
-    assert isinstance(class_names, (tuple, list))
-    img = mmcv.imread(img)
-    img = img.copy()
-    if isinstance(result, tuple):
-        bbox_result, segm_result = result
-    else:
-        bbox_result, segm_result = result, None
-    bboxes = np.vstack(bbox_result)
-    # draw segmentation masks
-    if segm_result is not None:
-        segms = mmcv.concat_list(segm_result)
-        inds = np.where(bboxes[:, -1] > score_thr)[0]
-        for i in inds:
-            color_mask = np.random.randint(0, 256, (1, 3), dtype=np.uint8)
-            mask = maskUtils.decode(segms[i]).astype(np.bool)
-            img[mask] = img[mask] * 0.5 + color_mask * 0.5
-    # draw bounding boxes
-    labels = [
-        np.full(bbox.shape[0], i, dtype=np.int32)
-        for i, bbox in enumerate(bbox_result)
-    ]
-    labels = np.concatenate(labels)
-    mmcv.imshow_det_bboxes(
-        img,
-        bboxes,
-        labels,
-        class_names=class_names,
-        score_thr=score_thr,
-        show=show,
-        wait_time=wait_time,
-        out_file=out_file)
-    if not (show or out_file):
-        return img
+    cfg = model.cfg
+    device = next(model.parameters()).device  # model device
+    # build the data pipeline
+    test_pipeline = [LoadImage()] + cfg.data.test.pipeline[1:]
+    test_pipeline = Compose(test_pipeline)
+    # prepare data
+    data = dict(img=img)
+    data = test_pipeline(data)
+    data = scatter(collate([data], samples_per_gpu=1), [device])[0]
+
+    # We don't restore `torch.is_grad_enabled()` value during concurrent
+    # inference since execution can overlap
+    torch.set_grad_enabled(False)
+    result = await model.aforward_test(rescale=True, **data)
+    return result
 
 
-def show_result_pyplot(img,
-                       result,
-                       class_names,
-                       score_thr=0.3,
-                       fig_size=(15, 10)):
+def show_result_pyplot(model, img, result, score_thr=0.3, fig_size=(15, 10)):
     """Visualize the detection results on the image.
 
     Args:
+        model (nn.Module): The loaded detector.
         img (str or np.ndarray): Image filename or loaded image.
         result (tuple[list] or list): The detection result, can be either
             (bbox, segm) or just bbox.
-        class_names (list[str] or tuple[str]): A list of class names.
         score_thr (float): The threshold to visualize the bboxes and masks.
         fig_size (tuple): Figure size of the pyplot figure.
-        out_file (str, optional): If specified, the visualization result will
-            be written to the out file instead of shown in a window.
     """
-    img = show_result(
-        img, result, class_names, score_thr=score_thr, show=False)
+    if hasattr(model, 'module'):
+        model = model.module
+    img = model.show_result(img, result, score_thr=score_thr, show=False)
     plt.figure(figsize=fig_size)
     plt.imshow(mmcv.bgr2rgb(img))
+    plt.show()
